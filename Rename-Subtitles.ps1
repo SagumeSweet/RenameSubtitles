@@ -239,6 +239,84 @@ function Get-LanguageTag {
     return (($finalTags -join '').ToUpperInvariant())
 }
 
+function Get-ExactLanguageTag {
+    <#
+        用于“语言子目录自动发现”的严格匹配函数。
+        只有当整个目录名都能被语种别名完整解释时，才认定它是语言目录。
+
+        例如：
+        - `sc` -> `SC`
+        - `tc` -> `TC`
+        - `scjp` -> `JPSC`
+
+        而像下面这些不会被识别为语言目录：
+        - `subtitle-sc`
+        - `backup_tc`
+        - `my-jp-folder`
+    #>
+    param(
+        [string]$Name,
+        [System.Collections.IDictionary]$Rules
+    )
+
+    $normalizedName = $Name.Trim().ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($normalizedName)) {
+        return $null
+    }
+
+    $aliasEntries = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in $Rules.GetEnumerator()) {
+        $aliasEntries.Add([PSCustomObject]@{
+            Canonical = [string]$entry.Key
+            Alias     = ([string]$entry.Key).ToLowerInvariant()
+            Length    = ([string]$entry.Key).Length
+        }) | Out-Null
+
+        foreach ($alias in $entry.Value) {
+            $aliasEntries.Add([PSCustomObject]@{
+                Canonical = [string]$entry.Key
+                Alias     = $alias.ToLowerInvariant()
+                Length    = $alias.Length
+            }) | Out-Null
+        }
+    }
+
+    $sortedAliasEntries = $aliasEntries | Sort-Object Length -Descending
+    $detectedTags = New-Object System.Collections.Generic.List[string]
+    $tokens = @([regex]::Split($normalizedName, '[\.\-_\s\[\]\(\)\{\}]+') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+
+    if ($tokens.Count -eq 0) {
+        return $null
+    }
+
+    foreach ($token in $tokens) {
+        $rest = $token
+        while ($rest.Length -gt 0) {
+            $matchedAlias = $sortedAliasEntries | Where-Object { $rest.StartsWith($_.Alias) } | Select-Object -First 1
+            if (-not $matchedAlias) {
+                return $null
+            }
+
+            if (-not $detectedTags.Contains($matchedAlias.Canonical)) {
+                $detectedTags.Add($matchedAlias.Canonical) | Out-Null
+            }
+            $rest = $rest.Substring($matchedAlias.Alias.Length)
+        }
+    }
+
+    if ($detectedTags.Count -eq 0) {
+        return $null
+    }
+
+    $priority = @('jp', 'sc', 'tc')
+    $sortedTags = $detectedTags | Sort-Object { $priority.IndexOf($_) }
+    $nonChineseTags = @($sortedTags | Where-Object { $_ -notin @('sc', 'tc') })
+    $chineseTags = @($sortedTags | Where-Object { $_ -in @('sc', 'tc') })
+    $finalTags = @($nonChineseTags + $chineseTags)
+
+    return (($finalTags -join '').ToUpperInvariant())
+}
+
 function Get-MatchTokens {
     <#
         从文件名中抽出用于“相似度匹配”的词项。
@@ -349,6 +427,7 @@ function Get-FolderLanguageTag {
 function Get-LanguageFolders {
     <#
         扫描顶层目录，找出可能的语言子目录，供运行时提示使用。
+        这里采用“目录名全文匹配”策略，避免因为模糊包含 `sc/tc/jp` 而误判。
     #>
     param(
         [string]$RootPath,
@@ -357,7 +436,7 @@ function Get-LanguageFolders {
 
     return @(
         Get-ChildItem -LiteralPath $RootPath -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-            $folderLanguageTag = Get-LanguageTag -Name $_.Name -Rules $Rules
+            $folderLanguageTag = Get-ExactLanguageTag -Name $_.Name -Rules $Rules
             if ($folderLanguageTag) {
                 [PSCustomObject]@{
                     Name     = $_.Name
