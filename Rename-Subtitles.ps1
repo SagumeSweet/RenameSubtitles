@@ -45,20 +45,8 @@ param (
     [string]$VideoQuery = "",
     [string]$SubtitleQuery = "",
     [string]$LanguageHint = "",
-    [string[]]$VideoEpisodePatterns = @(
-        '(?i)\bS(?<season>\d{1,2})[ ._-]*E(?<episode>\d{1,3})\b',
-        '(?i)\bE(?<episode>\d{1,3})\b',
-        '(?i)\[(?<episode>\d{1,3})\]',
-        '(?i)第\s*(?<episode>\d{1,3})\s*[集话話]',
-        '(?i)(?:^|[\s._\-\[\(])(?<episode>\d{1,2})(?:$|[\s._\-\]\)])'
-    ),
-    [string[]]$SubtitleEpisodePatterns = @(
-        '(?i)\bS(?<season>\d{1,2})[ ._-]*E(?<episode>\d{1,3})\b',
-        '(?i)\bE(?<episode>\d{1,3})\b',
-        '(?i)\[(?<episode>\d{1,3})\]',
-        '(?i)第\s*(?<episode>\d{1,3})\s*[集话話]',
-        '(?i)(?:^|[\s._\-\[\(])(?<episode>\d{1,2})(?:$|[\s._\-\]\)])'
-    ),
+    [string[]]$VideoEpisodePatterns = @(),
+    [string[]]$SubtitleEpisodePatterns = @(),
     [switch]$Recurse
 )
 
@@ -82,7 +70,38 @@ $script:LanguageRules = [ordered]@{
     sc = @('sc', 'chs', 'gb', 'cn', '简中', '简体', '简体中文')
     tc = @('tc', 'cht', 'big5', '繁中', '繁體', '繁體中文')
 }
+
+# 默认集数识别正则：当外部传入 $null 或空数组时，自动回退到这一组。
+[string[]]$script:DefaultEpisodePatterns = @(
+    '(?i)\bS(?<season>\d{1,2})[ ._-]*E(?<episode>\d{1,3})\b',
+    '(?i)\bE(?<episode>\d{1,3})\b',
+    '(?i)\[(?<episode>\d{1,3})\]',
+    '(?i)第\s*(?<episode>\d{1,3})\s*[集话話]',
+    '(?i)(?:^|[\s._\-\[\(])(?<episode>\d{1,2})(?:$|[\s._\-\]\)])'
+)
+
+# 统一控制语种标签输出顺序，并缓存语种别名元数据，避免每次识别都重复构造。
+[string[]]$script:LanguagePriority = @('jp', 'sc', 'tc')
+$script:LanguageMetadataCache = $null
 #endregion
+
+function Write-Log {
+    <#
+        统一控制台日志输出格式，便于观察当前处理进度。
+    #>
+    param(
+        [ValidateSet('Info', 'Step', 'Success', 'Warn')]
+        [string]$Level = 'Info',
+        [string]$Message
+    )
+
+    switch ($Level) {
+        'Info'    { Write-Host "[info] $Message" -ForegroundColor Cyan }
+        'Step'    { Write-Host "[step] $Message" -ForegroundColor DarkCyan }
+        'Success' { Write-Host "[success] $Message" -ForegroundColor Green }
+        'Warn'    { Write-Host "[warn] $Message" -ForegroundColor Yellow }
+    }
+}
 
 function New-SearchPatterns {
     <#
@@ -101,6 +120,24 @@ function New-SearchPatterns {
             "*$Query*.$_"
         }
     })
+}
+
+function Resolve-PatternList {
+    <#
+        兼容外部传入 `$null`、空数组、空字符串的情况；
+        一旦无有效正则，则自动回退到默认集数正则。
+    #>
+    param(
+        [string[]]$Patterns,
+        [string[]]$Fallback
+    )
+
+    [string[]]$resolvedPatterns = @($Patterns | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if (@($resolvedPatterns).Count -eq 0) {
+        return @($Fallback)
+    }
+
+    return $resolvedPatterns
 }
 
 function Convert-ToHalfWidthDigits {
@@ -159,7 +196,7 @@ function Get-EpisodeKey {
             }
         }
 
-        if ($captureValues.Count -ge 1) {
+        if (@($captureValues).Count -ge 1) {
             return ('E{0:D2}' -f [int]$captureValues[0])
         }
     }
@@ -167,55 +204,117 @@ function Get-EpisodeKey {
     return $null
 }
 
-function Get-LanguageTag {
+function Get-LanguageMetadata {
     <#
-        从文件名中识别语种标签。
-        支持：
-        - 分隔形式：.jp / -tc / _chs / [big5]
-        - 紧凑组合：SCJP / CHSJP / BIG5JP
-
-        输出规则：
-        - 无分隔符
-        - 统一大写
-        - 中文标签放最后，如 JPSC / JPTC
+        将语种规则预处理为可复用的别名元数据，并做脚本级缓存。
+        这样可避免每次识别语言时都重新遍历、排序整套别名表。
     #>
     param(
-        [string]$Name,
         [System.Collections.IDictionary]$Rules
     )
 
-    $detectedTags = New-Object System.Collections.Generic.List[string]
-    $aliasEntries = New-Object System.Collections.Generic.List[object]
-
-    foreach ($entry in $Rules.GetEnumerator()) {
-        foreach ($alias in $entry.Value) {
-            $aliasEntries.Add([PSCustomObject]@{
-                Canonical = [string]$entry.Key
-                Alias     = $alias.ToLowerInvariant()
-                Length    = $alias.Length
-            }) | Out-Null
-        }
+    if ($script:LanguageMetadataCache) {
+        return $script:LanguageMetadataCache
     }
 
-    $sortedAliasEntries = $aliasEntries | Sort-Object Length -Descending
-
-    foreach ($entry in $Rules.GetEnumerator()) {
-        foreach ($alias in $entry.Value) {
-            $escapedAlias = [regex]::Escape($alias)
-            $boundaryPattern = "(?i)(?:^|[\.\-_\s\[\]\(\)\{\}])$escapedAlias(?:$|[\.\-_\s\[\]\(\)\{\}])"
-            if ($Name -match $boundaryPattern -and -not $detectedTags.Contains([string]$entry.Key)) {
-                $detectedTags.Add([string]$entry.Key) | Out-Null
+    $aliasEntries = foreach ($entry in $Rules.GetEnumerator()) {
+        $canonical = ([string]$entry.Key).Trim().ToLowerInvariant()
+        foreach ($alias in @($canonical) + @($entry.Value)) {
+            $normalizedAlias = ([string]$alias).Trim().ToLowerInvariant()
+            if (-not [string]::IsNullOrWhiteSpace($normalizedAlias)) {
+                [PSCustomObject]@{
+                    Canonical = $canonical
+                    Alias     = $normalizedAlias
+                    Length    = $normalizedAlias.Length
+                }
             }
         }
     }
 
-    $normalizedName = $Name.ToLowerInvariant()
-    $tokens = [regex]::Split($normalizedName, '[\.\-_\s\[\]\(\)\{\}]+') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $script:LanguageMetadataCache = [PSCustomObject]@{
+        AliasEntries = @($aliasEntries | Sort-Object Alias -Unique | Sort-Object Length -Descending)
+        AliasNames   = @($aliasEntries | Select-Object -ExpandProperty Alias -Unique)
+    }
+
+    return $script:LanguageMetadataCache
+}
+
+function Convert-ToCanonicalLanguageTag {
+    <#
+        将已识别的语种标签标准化为统一格式。
+        规则：统一大写、无分隔符、中文标签放最后，例如 JPSC / JPTC。
+    #>
+    param(
+        [string[]]$Tags
+    )
+
+    [string[]]$normalizedTags = @(
+        $Tags |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            ForEach-Object { $_.Trim().ToLowerInvariant() } |
+            Select-Object -Unique
+    )
+
+    if (@($normalizedTags).Count -eq 0) {
+        return $null
+    }
+
+    [string[]]$orderedTags = @()
+    $orderedTags += @($normalizedTags | Where-Object { $_ -notin @('sc', 'tc') } | Sort-Object {
+        $index = $script:LanguagePriority.IndexOf($_)
+        if ($index -ge 0) { $index } else { 999 }
+    })
+    $orderedTags += @($normalizedTags | Where-Object { $_ -in @('sc', 'tc') } | Sort-Object {
+        $index = $script:LanguagePriority.IndexOf($_)
+        if ($index -ge 0) { $index } else { 999 }
+    })
+
+    return ((@($orderedTags | Select-Object -Unique) -join '').ToUpperInvariant())
+}
+
+function Get-LanguageTagCore {
+    <#
+        统一的语种识别内核：
+        - 普通模式：适合文件名识别，允许在噪声词中提取语种别名。
+        - 严格模式：要求整个 token 都能被语种别名完整解释，适合判断目录名是否就是语言目录。
+    #>
+    param(
+        [string]$Name,
+        [System.Collections.IDictionary]$Rules,
+        [switch]$RequireCompleteMatch
+    )
+
+    $normalizedName = ([string]$Name).Trim().ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($normalizedName)) {
+        return $null
+    }
+
+    $metadata = Get-LanguageMetadata -Rules $Rules
+    $detectedTags = New-Object System.Collections.Generic.List[string]
+
+    if (-not $RequireCompleteMatch) {
+        foreach ($entry in $metadata.AliasEntries) {
+            $escapedAlias = [regex]::Escape($entry.Alias)
+            $boundaryPattern = "(?i)(?:^|[\.\-_\s\[\]\(\)\{\}])$escapedAlias(?:$|[\.\-_\s\[\]\(\)\{\}])"
+            if ($normalizedName -match $boundaryPattern -and -not $detectedTags.Contains($entry.Canonical)) {
+                $detectedTags.Add($entry.Canonical) | Out-Null
+            }
+        }
+    }
+
+    $tokens = @([regex]::Split($normalizedName, '[\.\-_\s\[\]\(\)\{\}]+') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if (@($tokens).Count -eq 0) {
+        return $null
+    }
+
     foreach ($token in $tokens) {
         $rest = $token
         while ($rest.Length -gt 0) {
-            $matchedAlias = $sortedAliasEntries | Where-Object { $rest.StartsWith($_.Alias) } | Select-Object -First 1
+            $matchedAlias = $metadata.AliasEntries | Where-Object { $rest.StartsWith($_.Alias) } | Select-Object -First 1
             if (-not $matchedAlias) {
+                if ($RequireCompleteMatch) {
+                    return $null
+                }
                 break
             }
 
@@ -226,95 +325,33 @@ function Get-LanguageTag {
         }
     }
 
-    if ($detectedTags.Count -eq 0) {
-        return $null
-    }
-
-    $priority = @('jp', 'sc', 'tc')
-    $sortedTags = $detectedTags | Sort-Object { $priority.IndexOf($_) }
-    $nonChineseTags = @($sortedTags | Where-Object { $_ -notin @('sc', 'tc') })
-    $chineseTags = @($sortedTags | Where-Object { $_ -in @('sc', 'tc') })
-    $finalTags = @($nonChineseTags + $chineseTags)
-
-    return (($finalTags -join '').ToUpperInvariant())
+    return Convert-ToCanonicalLanguageTag -Tags $detectedTags
 }
 
-function Get-ExactLanguageTag {
+function Get-LanguageTag {
     <#
-        用于“语言子目录自动发现”的严格匹配函数。
-        只有当整个目录名都能被语种别名完整解释时，才认定它是语言目录。
-
-        例如：
-        - `sc` -> `SC`
-        - `tc` -> `TC`
-        - `scjp` -> `JPSC`
-
-        而像下面这些不会被识别为语言目录：
-        - `subtitle-sc`
-        - `backup_tc`
-        - `my-jp-folder`
+        从文件名中识别语种标签。
+        支持分隔形式（.jp / -tc / _chs）以及紧凑组合（SCJP / BIG5JP）。
     #>
     param(
         [string]$Name,
         [System.Collections.IDictionary]$Rules
     )
 
-    $normalizedName = $Name.Trim().ToLowerInvariant()
-    if ([string]::IsNullOrWhiteSpace($normalizedName)) {
-        return $null
-    }
+    return Get-LanguageTagCore -Name $Name -Rules $Rules
+}
 
-    $aliasEntries = New-Object System.Collections.Generic.List[object]
-    foreach ($entry in $Rules.GetEnumerator()) {
-        $aliasEntries.Add([PSCustomObject]@{
-            Canonical = [string]$entry.Key
-            Alias     = ([string]$entry.Key).ToLowerInvariant()
-            Length    = ([string]$entry.Key).Length
-        }) | Out-Null
+function Get-ExactLanguageTag {
+    <#
+        用于“语言子目录自动发现”的严格匹配函数。
+        只有当整个目录名都能被语种别名完整解释时，才认定它是语言目录。
+    #>
+    param(
+        [string]$Name,
+        [System.Collections.IDictionary]$Rules
+    )
 
-        foreach ($alias in $entry.Value) {
-            $aliasEntries.Add([PSCustomObject]@{
-                Canonical = [string]$entry.Key
-                Alias     = $alias.ToLowerInvariant()
-                Length    = $alias.Length
-            }) | Out-Null
-        }
-    }
-
-    $sortedAliasEntries = $aliasEntries | Sort-Object Length -Descending
-    $detectedTags = New-Object System.Collections.Generic.List[string]
-    $tokens = @([regex]::Split($normalizedName, '[\.\-_\s\[\]\(\)\{\}]+') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-
-    if ($tokens.Count -eq 0) {
-        return $null
-    }
-
-    foreach ($token in $tokens) {
-        $rest = $token
-        while ($rest.Length -gt 0) {
-            $matchedAlias = $sortedAliasEntries | Where-Object { $rest.StartsWith($_.Alias) } | Select-Object -First 1
-            if (-not $matchedAlias) {
-                return $null
-            }
-
-            if (-not $detectedTags.Contains($matchedAlias.Canonical)) {
-                $detectedTags.Add($matchedAlias.Canonical) | Out-Null
-            }
-            $rest = $rest.Substring($matchedAlias.Alias.Length)
-        }
-    }
-
-    if ($detectedTags.Count -eq 0) {
-        return $null
-    }
-
-    $priority = @('jp', 'sc', 'tc')
-    $sortedTags = $detectedTags | Sort-Object { $priority.IndexOf($_) }
-    $nonChineseTags = @($sortedTags | Where-Object { $_ -notin @('sc', 'tc') })
-    $chineseTags = @($sortedTags | Where-Object { $_ -in @('sc', 'tc') })
-    $finalTags = @($nonChineseTags + $chineseTags)
-
-    return (($finalTags -join '').ToUpperInvariant())
+    return Get-LanguageTagCore -Name $Name -Rules $Rules -RequireCompleteMatch
 }
 
 function Get-MatchTokens {
@@ -337,11 +374,8 @@ function Get-MatchTokens {
         ' '
     )
 
-    $languageAliases = @()
-    foreach ($entry in $Rules.GetEnumerator()) {
-        $languageAliases += ([string]$entry.Key).ToLowerInvariant()
-        $languageAliases += @($entry.Value | ForEach-Object { $_.ToLowerInvariant() })
-    }
+    $languageMetadata = Get-LanguageMetadata -Rules $Rules
+    [string[]]$languageAliases = @($languageMetadata.AliasNames)
 
     [string[]]$tokens = @(
         [regex]::Split($cleanName.ToLowerInvariant(), '[^\p{L}\p{Nd}]+') | Where-Object {
@@ -367,11 +401,11 @@ function Select-BestVideoMatch {
     )
 
     [object[]]$videoArray = @($Videos)
-    if ($videoArray.Count -eq 0) {
+    if (@($videoArray).Count -eq 0) {
         return $null
     }
 
-    if ($videoArray.Count -eq 1) {
+    if (@($videoArray).Count -eq 1) {
         return $videoArray[0]
     }
 
@@ -395,15 +429,103 @@ function Select-BestVideoMatch {
         )
     )
 
-    if ($orderedCandidates.Count -eq 1) {
+    if (@($orderedCandidates).Count -eq 1) {
         return $orderedCandidates[0].Video
     }
 
-    if ($orderedCandidates[0].Score -gt $orderedCandidates[1].Score) {
+    if (@($orderedCandidates).Count -ge 2 -and $orderedCandidates[0].Score -gt $orderedCandidates[1].Score) {
         return $orderedCandidates[0].Video
     }
 
     return $null
+}
+
+function Convert-ToLanguageFolderInfo {
+    <#
+        将语言目录候选项统一转换为标准结构，避免不同对象形态导致 `.Name/.Path/.Language`
+        属性访问失败。
+    #>
+    param(
+        [object]$InputObject,
+        [System.Collections.IDictionary]$Rules
+    )
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    $name = $null
+    $path = $null
+    $language = $null
+
+    if ($InputObject -is [string]) {
+        $name = $InputObject.Trim()
+    }
+    else {
+        $properties = $InputObject.PSObject.Properties
+
+        if ($properties.Match('Name').Count -gt 0 -and $null -ne $InputObject.Name) {
+            $name = [string]$InputObject.Name
+        }
+        elseif ($properties.Match('BaseName').Count -gt 0 -and $null -ne $InputObject.BaseName) {
+            $name = [string]$InputObject.BaseName
+        }
+
+        if ($properties.Match('Path').Count -gt 0 -and $null -ne $InputObject.Path) {
+            $path = [string]$InputObject.Path
+        }
+        elseif ($properties.Match('FullName').Count -gt 0 -and $null -ne $InputObject.FullName) {
+            $path = [string]$InputObject.FullName
+        }
+
+        if ($properties.Match('Language').Count -gt 0 -and $null -ne $InputObject.Language) {
+            $language = [string]$InputObject.Language
+        }
+
+        if ([string]::IsNullOrWhiteSpace($name) -and -not [string]::IsNullOrWhiteSpace($path)) {
+            $name = Split-Path -Leaf $path
+        }
+    }
+
+    if (-not $language -and -not [string]::IsNullOrWhiteSpace($name)) {
+        $language = Get-ExactLanguageTag -Name $name -Rules $Rules
+    }
+
+    if ([string]::IsNullOrWhiteSpace($language)) {
+        return $null
+    }
+
+    return [PSCustomObject]@{
+        Name     = $name
+        Path     = $path
+        Language = $language.ToUpperInvariant()
+    }
+}
+
+function Get-LanguageFolderSummary {
+    <#
+        将语言目录列表格式化为稳定的摘要文本，避免直接访问不存在的属性。
+    #>
+    param(
+        [object[]]$LanguageFolders,
+        [System.Collections.IDictionary]$Rules
+    )
+
+    [string[]]$items = @(
+        $LanguageFolders | ForEach-Object {
+            $folderInfo = Convert-ToLanguageFolderInfo -InputObject $_ -Rules $Rules
+            if ($null -ne $folderInfo) {
+                if ([string]::IsNullOrWhiteSpace($folderInfo.Name)) {
+                    "[$($folderInfo.Language)]"
+                }
+                else {
+                    "$($folderInfo.Name) [$($folderInfo.Language)]"
+                }
+            }
+        } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+
+    return ($items -join ', ')
 }
 
 function Get-FolderLanguageTag {
@@ -415,7 +537,14 @@ function Get-FolderLanguageTag {
         [object[]]$LanguageFolders
     )
 
-    foreach ($folder in $LanguageFolders | Sort-Object { $_.Path.Length } -Descending) {
+    [object[]]$normalizedFolders = @(
+        $LanguageFolders |
+            ForEach-Object { Convert-ToLanguageFolderInfo -InputObject $_ -Rules $script:LanguageRules } |
+            Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace($_.Path) } |
+            Sort-Object { $_.Path.Length } -Descending
+    )
+
+    foreach ($folder in $normalizedFolders) {
         if ($Path.StartsWith($folder.Path, [System.StringComparison]::OrdinalIgnoreCase)) {
             return $folder.Language
         }
@@ -435,22 +564,37 @@ function Get-LanguageFolders {
     )
 
     return @(
-        Get-ChildItem -LiteralPath $RootPath -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-            $folderLanguageTag = Get-ExactLanguageTag -Name $_.Name -Rules $Rules
-            if ($folderLanguageTag) {
-                [PSCustomObject]@{
-                    Name     = $_.Name
-                    Path     = $_.FullName
-                    Language = $folderLanguageTag
-                }
+        foreach ($directory in @(Get-ChildItem -LiteralPath $RootPath -Directory -ErrorAction SilentlyContinue)) {
+            $folderInfo = Convert-ToLanguageFolderInfo -InputObject $directory -Rules $Rules
+            if ($folderInfo) {
+                $folderInfo
             }
         }
     )
 }
 
+function Test-AnyPatternMatch {
+    <#
+        判断文件名是否命中任意一个 PowerShell 通配符模式。
+    #>
+    param(
+        [string]$Name,
+        [string[]]$Patterns
+    )
+
+    foreach ($pattern in $Patterns) {
+        if ($Name -like $pattern) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
 function Get-FilesSafely {
     <#
         统一封装文件枚举，出错时抛出更明确的错误信息。
+        使用 -LiteralPath，避免目录名中包含 [] 等字符时被当成通配符解释。
     #>
     param(
         [string]$SearchPath,
@@ -460,15 +604,213 @@ function Get-FilesSafely {
     )
 
     try {
-        if ($Recursive) {
-            return @(Get-ChildItem -Path $SearchPath -File -Recurse -Include $Patterns)
+        $items = if ($Recursive) {
+            Get-ChildItem -LiteralPath $SearchPath -File -Recurse -ErrorAction Stop
+        }
+        else {
+            Get-ChildItem -LiteralPath $SearchPath -File -ErrorAction Stop
         }
 
-        return @(Get-ChildItem -Path $SearchPath -File -Include $Patterns)
+        return @($items | Where-Object { Test-AnyPatternMatch -Name $_.Name -Patterns $Patterns })
     }
     catch {
-        throw "枚举$Label失败：$($_.Exception.Message)"
+        throw "枚举${Label}失败：$($_.Exception.Message)"
     }
+}
+
+function Confirm-LanguageFolderProcessing {
+    <#
+        将“是否自动处理语言子目录”的交互逻辑独立出来，减少主流程分支复杂度。
+        这里会先对目录对象做标准化，避免远程环境中出现对象属性不一致的问题。
+    #>
+    param(
+        [object[]]$LanguageFolders,
+        [bool]$DefaultValue,
+        [bool]$IsRecursive
+    )
+
+    [object[]]$normalizedFolders = @(
+        $LanguageFolders |
+            ForEach-Object { Convert-ToLanguageFolderInfo -InputObject $_ -Rules $script:LanguageRules } |
+            Where-Object { $_ }
+    )
+
+    if ($IsRecursive -or @($normalizedFolders).Count -eq 0) {
+        return $DefaultValue
+    }
+
+    $folderSummary = Get-LanguageFolderSummary -LanguageFolders $normalizedFolders -Rules $script:LanguageRules
+    if ([string]::IsNullOrWhiteSpace($folderSummary)) {
+        return $DefaultValue
+    }
+
+    Write-Log -Level Info -Message "检测到可能的语言子目录：$folderSummary"
+
+    try {
+        $choices = [System.Management.Automation.Host.ChoiceDescription[]]@(
+            (New-Object System.Management.Automation.Host.ChoiceDescription '&Yes', '自动搜索这些子文件夹，并将字幕移动到视频旁边。'),
+            (New-Object System.Management.Automation.Host.ChoiceDescription '&No', '仅处理当前目录中的字幕文件。')
+        )
+        $selection = $Host.UI.PromptForChoice(
+            '检测到语言子文件夹',
+            "发现可能的字幕语言子目录：$folderSummary`n是否自动处理这些子目录中的字幕？",
+            $choices,
+            1
+        )
+
+        if ($selection -eq 0) {
+            Write-Log -Level Success -Message '已启用语言子目录自动处理。'
+            return $true
+        }
+
+        Write-Log -Level Info -Message '将仅处理当前目录中的字幕文件。'
+        return $false
+    }
+    catch {
+        Write-Log -Level Warn -Message "检测到了语言子文件夹（$folderSummary），但当前环境无法弹出交互提示。若要自动处理子目录，请改用 -Recurse。"
+        return $DefaultValue
+    }
+}
+
+function Get-VideoEpisodeIndex {
+    <#
+        将视频预先建立为“集数键 -> 候选视频列表”的索引，便于后续字幕匹配。
+    #>
+    param(
+        [System.IO.FileInfo[]]$Videos,
+        [string[]]$EpisodePatterns
+    )
+
+    $videosByEpisode = @{}
+    foreach ($video in @($Videos | Sort-Object Name)) {
+        $episodeKey = Get-EpisodeKey -Name $video.BaseName -Patterns $EpisodePatterns
+        if (-not $episodeKey) {
+            Write-Verbose "跳过无法识别集数的视频：$($video.Name)"
+            continue
+        }
+
+        if (-not $videosByEpisode.ContainsKey($episodeKey)) {
+            $videosByEpisode[$episodeKey] = New-Object System.Collections.Generic.List[object]
+        }
+
+        $videosByEpisode[$episodeKey].Add($video)
+    }
+
+    return $videosByEpisode
+}
+
+function Resolve-SubtitleLanguage {
+    <#
+        统一语种决策优先级：文件名 > 所在语言目录 > 用户传入的 LanguageHint。
+    #>
+    param(
+        [System.IO.FileInfo]$Subtitle,
+        [object[]]$LanguageFolders,
+        [string]$RequestedLanguageTag,
+        [System.Collections.IDictionary]$Rules
+    )
+
+    $folderLanguageTag = Get-FolderLanguageTag -Path $Subtitle.DirectoryName -LanguageFolders $LanguageFolders
+    $fileLanguageTag = Get-LanguageTag -Name $Subtitle.BaseName -Rules $Rules
+
+    $resolvedLanguageTag = if ($fileLanguageTag) {
+        $fileLanguageTag
+    }
+    elseif ($folderLanguageTag) {
+        $folderLanguageTag
+    }
+    else {
+        $RequestedLanguageTag
+    }
+
+    return [PSCustomObject]@{
+        FileLanguageTag   = $fileLanguageTag
+        FolderLanguageTag = $folderLanguageTag
+        LanguageTag       = $resolvedLanguageTag
+    }
+}
+
+function Invoke-SubtitleRenameAction {
+    <#
+        处理单个字幕文件：识别集数、匹配视频、解析语种、执行改名/移动。
+        将单文件逻辑收敛到一个函数中，主流程只负责“扫描与调度”。
+    #>
+    param(
+        [System.Management.Automation.PSCmdlet]$Cmdlet,
+        [System.IO.FileInfo]$Subtitle,
+        [hashtable]$VideosByEpisode,
+        [string[]]$EpisodePatterns,
+        [object[]]$LanguageFolders,
+        [string]$RequestedLanguageTag,
+        [bool]$ProcessLanguageFolders,
+        [System.Collections.IDictionary]$Rules
+    )
+
+    Write-Log -Level Step -Message "处理字幕：$($Subtitle.Name)"
+
+    $episodeKey = Get-EpisodeKey -Name $Subtitle.BaseName -Patterns $EpisodePatterns
+    if (-not $episodeKey) {
+        Write-Log -Level Warn -Message "无法识别集数，已跳过：$($Subtitle.Name)"
+        return $null
+    }
+
+    Write-Log -Level Info -Message "识别到集数键：$episodeKey"
+
+    if (-not $VideosByEpisode.ContainsKey($episodeKey)) {
+        Write-Log -Level Warn -Message "未找到对应视频：$($Subtitle.Name) [$episodeKey]"
+        return $null
+    }
+
+    [object[]]$candidateVideos = $VideosByEpisode[$episodeKey].ToArray()
+    $video = Select-BestVideoMatch -Videos $candidateVideos -SubtitleName $Subtitle.BaseName -Rules $Rules
+    if (-not $video) {
+        $candidateNames = ($candidateVideos | Select-Object -ExpandProperty Name) -join ', '
+        Write-Log -Level Warn -Message "存在多个候选视频，无法自动判断：$($Subtitle.Name) [$episodeKey]。候选：$candidateNames"
+        return (New-ResultObject -Status 'Ambiguous' -EpisodeKey $episodeKey -Language $null -OldName $Subtitle.Name -NewName $null)
+    }
+
+    Write-Log -Level Info -Message "匹配视频：$($video.Name)"
+
+    $languageDecision = Resolve-SubtitleLanguage -Subtitle $Subtitle -LanguageFolders $LanguageFolders -RequestedLanguageTag $RequestedLanguageTag -Rules $Rules
+    $languageTag = $languageDecision.LanguageTag
+    $targetInfo = Resolve-SubtitleTarget -Subtitle $Subtitle -Video $video -LanguageTag $languageTag -ProcessLanguageFolders $ProcessLanguageFolders -FolderLanguageTag $languageDecision.FolderLanguageTag
+
+    if ($languageTag) {
+        Write-Log -Level Info -Message "识别语种：$languageTag"
+    }
+    else {
+        Write-Log -Level Info -Message '未识别到语种标签，将直接使用视频主体名。'
+    }
+
+    Write-Log -Level Info -Message "目标路径：$($targetInfo.TargetPath)"
+
+    if ($Subtitle.FullName -eq $targetInfo.TargetPath) {
+        Write-Log -Level Info -Message '文件名已符合目标格式，无需修改。'
+        return (New-ResultObject -Status 'Unchanged' -EpisodeKey $episodeKey -Language $languageTag -OldName $Subtitle.Name -NewName $targetInfo.NewName)
+    }
+
+    if (Test-Path -LiteralPath $targetInfo.TargetPath) {
+        Write-Log -Level Warn -Message "目标文件已存在，已跳过：$($targetInfo.NewName)"
+        return (New-ResultObject -Status 'SkippedExists' -EpisodeKey $episodeKey -Language $languageTag -OldName $Subtitle.Name -NewName $targetInfo.NewName)
+    }
+
+    try {
+        if ($Cmdlet.ShouldProcess($Subtitle.FullName, "Move/Rename to $($targetInfo.TargetPath)")) {
+            Move-Item -LiteralPath $Subtitle.FullName -Destination $targetInfo.TargetPath -ErrorAction Stop
+            $status = if ($targetInfo.TargetDirectory -ne $Subtitle.DirectoryName) { 'MovedRenamed' } else { 'Renamed' }
+            Write-Log -Level Success -Message "已处理：$($Subtitle.Name) -> $($targetInfo.NewName)"
+        }
+        else {
+            $status = 'WhatIf'
+            Write-Log -Level Info -Message "预览模式：将执行 $($Subtitle.Name) -> $($targetInfo.NewName)"
+        }
+    }
+    catch {
+        Write-Log -Level Warn -Message "处理字幕失败：$($Subtitle.Name) -> $($targetInfo.NewName)，原因：$($_.Exception.Message)"
+        return (New-ResultObject -Status 'Error' -EpisodeKey $episodeKey -Language $languageTag -OldName $Subtitle.Name -NewName $targetInfo.NewName)
+    }
+
+    return (New-ResultObject -Status $status -EpisodeKey $episodeKey -Language $languageTag -OldName $Subtitle.Name -NewName $targetInfo.NewName)
 }
 
 function New-ResultObject {
@@ -533,7 +875,7 @@ function Write-ResultSummary {
         [object[]]$Results
     )
 
-    if (-not $Results -or $Results.Count -eq 0) {
+    if (-not $Results -or @($Results).Count -eq 0) {
         Write-Host '未产生任何处理结果。' -ForegroundColor Yellow
         return
     }
@@ -551,10 +893,17 @@ if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
 }
 
 $resolvedDirectory = (Resolve-Path -LiteralPath $Directory).Path
-$searchPath = Join-Path -Path $resolvedDirectory -ChildPath '*'
+$searchPath = $resolvedDirectory
+
+Write-Log -Level Step -Message "开始处理目录：$resolvedDirectory"
+Write-Log -Level Info -Message "视频筛选关键字：$([string]::IsNullOrWhiteSpace($VideoQuery) ? '<空>' : $VideoQuery)"
+Write-Log -Level Info -Message "字幕筛选关键字：$([string]::IsNullOrWhiteSpace($SubtitleQuery) ? '<空>' : $SubtitleQuery)"
+Write-Log -Level Info -Message "是否递归扫描：$($Recurse.IsPresent)"
 
 $videoPatterns = New-SearchPatterns -Query $VideoQuery -Extensions $script:VideoExtensions
 $subtitlePatterns = New-SearchPatterns -Query $SubtitleQuery -Extensions $script:SubtitleExtensions
+$VideoEpisodePatterns = Resolve-PatternList -Patterns $VideoEpisodePatterns -Fallback $script:DefaultEpisodePatterns
+$SubtitleEpisodePatterns = Resolve-PatternList -Patterns $SubtitleEpisodePatterns -Fallback $script:DefaultEpisodePatterns
 $requestedLanguageTag = if ([string]::IsNullOrWhiteSpace($LanguageHint)) {
     $null
 }
@@ -562,133 +911,55 @@ else {
     Get-LanguageTag -Name $LanguageHint -Rules $script:LanguageRules
 }
 
-# 检测是否存在 `sc / tc / jp` 等语言子文件夹；如果存在，运行中提示用户是否自动处理。
-$languageFolders = Get-LanguageFolders -RootPath $resolvedDirectory -Rules $script:LanguageRules
-$processLanguageFolders = $Recurse.IsPresent
-if (-not $Recurse.IsPresent -and $languageFolders.Count -gt 0) {
-    $folderSummary = ($languageFolders | ForEach-Object { "$($_.Name) [$($_.Language)]" }) -join ', '
-    try {
-        $choices = [System.Management.Automation.Host.ChoiceDescription[]]@(
-            (New-Object System.Management.Automation.Host.ChoiceDescription '&Yes', '自动搜索这些子文件夹，并将字幕移动到视频旁边。'),
-            (New-Object System.Management.Automation.Host.ChoiceDescription '&No', '仅处理当前目录中的字幕文件。')
-        )
-        $selection = $Host.UI.PromptForChoice(
-            '检测到语言子文件夹',
-            "发现可能的字幕语言子目录：$folderSummary`n是否自动处理这些子目录中的字幕？",
-            $choices,
-            1
-        )
-
-        if ($selection -eq 0) {
-            $processLanguageFolders = $true
-        }
-    }
-    catch {
-        Write-Warning "检测到了语言子文件夹（$folderSummary），但当前环境无法弹出交互提示。若要自动处理子目录，请改用 -Recurse。"
-    }
+if ($requestedLanguageTag) {
+    Write-Log -Level Info -Message "已设置语种提示：$requestedLanguageTag"
 }
+
+# 检测是否存在 `sc / tc / jp` 等语言子文件夹；如有需要，运行时询问是否纳入处理范围。
+$languageFolders = Get-LanguageFolders -RootPath $resolvedDirectory -Rules $script:LanguageRules
+$processLanguageFolders = Confirm-LanguageFolderProcessing -LanguageFolders $languageFolders -DefaultValue $Recurse.IsPresent -IsRecursive $Recurse.IsPresent
 
 $videoFiles = Get-FilesSafely -SearchPath $searchPath -Patterns $videoPatterns -Recursive $Recurse.IsPresent -Label '视频文件'
 $subtitleFiles = Get-FilesSafely -SearchPath $searchPath -Patterns $subtitlePatterns -Recursive ($Recurse.IsPresent -or $processLanguageFolders) -Label '字幕文件'
 
 if (-not $videoFiles) {
-    Write-Warning "目录 '$resolvedDirectory' 中未找到视频文件。"
+    Write-Log -Level Warn -Message "目录中未找到视频文件：$resolvedDirectory"
     return
 }
 
 if (-not $subtitleFiles) {
-    Write-Warning "目录 '$resolvedDirectory' 中未找到字幕文件。"
+    Write-Log -Level Warn -Message "目录中未找到字幕文件：$resolvedDirectory"
     return
 }
+
+Write-Log -Level Info -Message "扫描完成：视频 $(@($videoFiles).Count) 个，字幕 $(@($subtitleFiles).Count) 个。"
 
 # 先将视频按集数分组，供后续字幕逐个匹配。
-$videosByEpisode = @{}
-foreach ($video in $videoFiles | Sort-Object Name) {
-    $episodeKey = Get-EpisodeKey -Name $video.BaseName -Patterns $VideoEpisodePatterns
-    if (-not $episodeKey) {
-        Write-Verbose "跳过无法识别集数的视频：$($video.Name)"
-        continue
-    }
+$videosByEpisode = Get-VideoEpisodeIndex -Videos $videoFiles -EpisodePatterns $VideoEpisodePatterns
 
-    if (-not $videosByEpisode.ContainsKey($episodeKey)) {
-        $videosByEpisode[$episodeKey] = New-Object System.Collections.Generic.List[object]
-    }
-
-    $videosByEpisode[$episodeKey].Add($video)
-}
-
-if ($videosByEpisode.Count -eq 0) {
-    Write-Warning "已找到视频文件，但没有任何文件能识别出有效集数。"
+if (@($videosByEpisode.Keys).Count -eq 0) {
+    Write-Log -Level Warn -Message '没有任何视频能识别出有效集数，无法继续匹配。'
     return
 }
+
+Write-Log -Level Success -Message "视频索引建立完成：共识别到 $(@($videosByEpisode.Keys).Count) 个集数键。"
 
 # 结果表：用于回显每个字幕的处理状态
 $results = New-Object System.Collections.Generic.List[object]
 foreach ($subtitle in $subtitleFiles | Sort-Object Name) {
-    $episodeKey = Get-EpisodeKey -Name $subtitle.BaseName -Patterns $SubtitleEpisodePatterns
-    if (-not $episodeKey) {
-        Write-Warning "跳过无法识别集数的字幕：$($subtitle.Name)"
-        continue
-    }
+    $result = Invoke-SubtitleRenameAction `
+        -Cmdlet $PSCmdlet `
+        -Subtitle $subtitle `
+        -VideosByEpisode $videosByEpisode `
+        -EpisodePatterns $SubtitleEpisodePatterns `
+        -LanguageFolders $languageFolders `
+        -RequestedLanguageTag $requestedLanguageTag `
+        -ProcessLanguageFolders $processLanguageFolders `
+        -Rules $script:LanguageRules
 
-    if (-not $videosByEpisode.ContainsKey($episodeKey)) {
-        # 如果某个视频没有字幕对应，它不会被改动；这里仅对“找不到视频的字幕”给出提示。
-        Write-Warning "未找到与字幕匹配的视频：$($subtitle.Name) [$episodeKey]"
-        continue
+    if ($result) {
+        $results.Add($result) | Out-Null
     }
-
-    [object[]]$candidateVideos = $videosByEpisode[$episodeKey].ToArray()
-    $video = Select-BestVideoMatch -Videos $candidateVideos -SubtitleName $subtitle.BaseName -Rules $script:LanguageRules
-    if (-not $video) {
-        $candidateNames = ($candidateVideos | Select-Object -ExpandProperty Name) -join ', '
-        Write-Warning "该字幕对应多个候选视频，无法自动判断：$($subtitle.Name) [$episodeKey]。候选：$candidateNames"
-        $results.Add((New-ResultObject -Status 'Ambiguous' -EpisodeKey $episodeKey -Language $null -OldName $subtitle.Name -NewName $null)) | Out-Null
-        continue
-    }
-
-    # 语种优先级：文件名 > 所在语言目录 > 用户输入的 SubtitleQuery 回退提示
-    $folderLanguageTag = Get-FolderLanguageTag -Path $subtitle.DirectoryName -LanguageFolders $languageFolders
-    $languageTag = Get-LanguageTag -Name $subtitle.BaseName -Rules $script:LanguageRules
-    if (-not $languageTag) {
-        $languageTag = $folderLanguageTag
-    }
-    if (-not $languageTag) {
-        $languageTag = $requestedLanguageTag
-    }
-
-    $targetInfo = Resolve-SubtitleTarget -Subtitle $subtitle -Video $video -LanguageTag $languageTag -ProcessLanguageFolders $processLanguageFolders -FolderLanguageTag $folderLanguageTag
-    $newName = $targetInfo.NewName
-    $targetDirectory = $targetInfo.TargetDirectory
-    $targetPath = $targetInfo.TargetPath
-
-    if ($subtitle.FullName -eq $targetPath) {
-        $results.Add((New-ResultObject -Status 'Unchanged' -EpisodeKey $episodeKey -Language $languageTag -OldName $subtitle.Name -NewName $newName)) | Out-Null
-        continue
-    }
-
-    if (Test-Path -LiteralPath $targetPath) {
-        Write-Warning "目标文件已存在，已跳过：$newName"
-        $results.Add((New-ResultObject -Status 'SkippedExists' -EpisodeKey $episodeKey -Language $languageTag -OldName $subtitle.Name -NewName $newName)) | Out-Null
-        continue
-    }
-
-    try {
-        if ($PSCmdlet.ShouldProcess($subtitle.FullName, "Move/Rename to $targetPath")) {
-            # 使用 Move-Item 是因为它既能改名，也能在需要时把字幕从语言子目录移动到视频旁边。
-            Move-Item -LiteralPath $subtitle.FullName -Destination $targetPath
-            $status = if ($targetDirectory -ne $subtitle.DirectoryName) { 'MovedRenamed' } else { 'Renamed' }
-        }
-        else {
-            $status = 'WhatIf'
-        }
-    }
-    catch {
-        Write-Warning "处理字幕失败：$($subtitle.Name) -> $newName，原因：$($_.Exception.Message)"
-        $results.Add((New-ResultObject -Status 'Error' -EpisodeKey $episodeKey -Language $languageTag -OldName $subtitle.Name -NewName $newName)) | Out-Null
-        continue
-    }
-
-    $results.Add((New-ResultObject -Status $status -EpisodeKey $episodeKey -Language $languageTag -OldName $subtitle.Name -NewName $newName)) | Out-Null
 }
 
 $results
