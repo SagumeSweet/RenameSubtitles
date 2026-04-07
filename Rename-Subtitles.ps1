@@ -64,11 +64,53 @@ $ErrorActionPreference = 'Stop'
     'srt', 'ass', 'ssa', 'sub', 'idx', 'vtt', 'ttml', 'dfxp', 'smi', 'sami', 'aqt', 'mpl2', 'pjs', 'stl', 'usf', 'jss', 'sbv', 'lrc'
 )
 
-# 语种别名表：值越全，识别越稳
+# 语种别名表：参考 ISO 639 常用语言码 + 动漫/影视字幕社区常见写法统一管理。
 $script:LanguageRules = [ordered]@{
-    jp = @('jp', 'jpn', 'ja', 'japanese', '日语', '日文')
-    sc = @('sc', 'chs', 'gb', 'cn', '简中', '简体', '简体中文')
-    tc = @('tc', 'cht', 'big5', '繁中', '繁體', '繁體中文')
+    jp = @(
+        'jp', 'jpn', 'ja', 'jap', 'japanese', 'nihongo',
+        '日本語', '日本语', '日語', '日语', '日文', '日配', '日字'
+    )
+    en = @(
+        'en', 'eng', 'english',
+        '英文', '英语', '英語', '英字'
+    )
+    sc = @(
+        'sc', 'chs', 'zhs', 'zh-hans', 'zh_cn', 'zh-cn', 'cn', 'gb', 'gb2312',
+        '简中', '簡中', '简体', '简体中文', '简体字幕', '简体中字'
+    )
+    tc = @(
+        'tc', 'cht', 'zht', 'zh-hant', 'zh_tw', 'zh-tw', 'big5',
+        '繁中', '繁体', '繁體', '繁体中文', '繁體中文', '繁体字幕', '繁體字幕', '繁体中字', '繁體中字'
+    )
+}
+
+# 常见“发布/压制噪声”规则：参考 P2P/Scene/Servarr/TRaSH 等命名习惯统一维护。
+$script:ReleaseNoiseRules = [ordered]@{
+    Resolution = @(
+        '\b(?:4320|2160|1440|1080|720|576|540|480)p\b',
+        '\b(?:8k|4k|uhd)\b'
+    )
+    Source = @(
+        '\b(?:web(?:[-. ]?(?:dl|rip|cap))?|bluray|blu[-. ]?ray|b[dr]rip|brrip|bdmv|bdremux|remux|hdrip|dvdrip|dvd(?:5|9)?|hdtv|tvrip)\b'
+    )
+    VideoCodec = @(
+        '\b(?:x26[45]|xvid|divx|h\.?26[45]|hevc|avc|av1|vp9|vc-?1)\b'
+    )
+    BitDepth = @(
+        '\b(?:hi10p|10bit|8bit)\b'
+    )
+    AudioCodec = @(
+        '\b(?:aac(?:2\.0|5\.1)?|flac|alac|truehd|atmos|dts(?:-?hd(?:ma|hra)?|-?es|x)?|eac3|ac3|ddp(?:\+)?|dd\+|opus|mp3|pcm|lpcm)\b'
+    )
+    DynamicRange = @(
+        '\b(?:hdr10\+?|hdr|dolby[-. ]?vision|dovi|dv|sdr)\b'
+    )
+    StreamingService = @(
+        '\b(?:amzn|atvp|dsnp|nf|hmax|u-?next|viu|tver|fod|abema|b[- ]?global|bilibili|bahamut|baha)\b'
+    )
+    ReleaseMeta = @(
+        '\b(?:proper|repack\d*|rerip|uncut|complete|batch|合集|内封|內封|内嵌|內嵌|外挂|外掛|dual[-. ]?audio|multi(?:[-. ]?sub(?:s)?)?|softsub(?:s)?|hardsub(?:s)?|fansub(?:s)?|official|retail|cc|sdh|dub(?:bed)?|subbed|raw(?:s)?|v[2-4])\b'
+    )
 }
 
 # 默认集数识别正则：当外部传入 $null 或空数组时，自动回退到这一组。
@@ -80,9 +122,10 @@ $script:LanguageRules = [ordered]@{
     '(?i)(?:^|[\s._\-\[\(])(?<episode>\d{1,2})(?:$|[\s._\-\]\)])'
 )
 
-# 统一控制语种标签输出顺序，并缓存语种别名元数据，避免每次识别都重复构造。
-[string[]]$script:LanguagePriority = @('jp', 'sc', 'tc')
+# 统一控制语种标签输出顺序，并缓存语种别名元数据/噪声正则，避免每次识别都重复构造。
+[string[]]$script:LanguagePriority = @('jp', 'en', 'sc', 'tc')
 $script:LanguageMetadataCache = $null
+$script:ReleaseNoisePatternCache = $null
 #endregion
 
 function Write-Log {
@@ -152,17 +195,49 @@ function Convert-ToHalfWidthDigits {
     })
 }
 
+function Get-ReleaseNoisePattern {
+    <#
+        将按类别维护的噪声规则拼成一个统一正则。
+        后续如果要新增 WEB 源、音频编码、平台名，只需改顶部常量即可。
+    #>
+    param(
+        [System.Collections.IDictionary]$Rules
+    )
+
+    if ($script:ReleaseNoisePatternCache) {
+        return $script:ReleaseNoisePatternCache
+    }
+
+    [string[]]$patternParts = @(
+        $Rules.GetEnumerator() | ForEach-Object {
+            @($_.Value) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        }
+    )
+
+    if (@($patternParts).Count -eq 0) {
+        return $null
+    }
+
+    $script:ReleaseNoisePatternCache = '(?i)(?:' + (($patternParts | ForEach-Object { "(?:$_)" }) -join '|') + ')'
+    return $script:ReleaseNoisePatternCache
+}
+
 function Remove-ReleaseNoise {
     <#
         去掉常见发布信息噪声，减少把 1080p / x265 / 10bit 等误识别成集数的概率。
     #>
     param([string]$Text)
 
-    return [regex]::Replace(
-        $Text,
-        '(?i)(?:\b\d{3,4}p\b|\b(?:x26[45]|h\.?26[45]|hevc|avc)\b|\b(?:10|8)bit\b|\b(?:aac|flac|dts|truehd|atmos)\b|\b(?:webrip|web[- ]?dl|bdrip|bluray|remux)\b|\b(?:uhd|hdr|dv)\b)',
-        ' '
-    )
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $Text
+    }
+
+    $noisePattern = Get-ReleaseNoisePattern -Rules $script:ReleaseNoiseRules
+    if ([string]::IsNullOrWhiteSpace($noisePattern)) {
+        return $Text
+    }
+
+    return [regex]::Replace($Text, $noisePattern, ' ')
 }
 
 function Get-EpisodeKey {
@@ -309,19 +384,31 @@ function Get-LanguageTagCore {
 
     foreach ($token in $tokens) {
         $rest = $token
+        $tokenMatches = New-Object System.Collections.Generic.List[string]
+
         while ($rest.Length -gt 0) {
             $matchedAlias = $metadata.AliasEntries | Where-Object { $rest.StartsWith($_.Alias) } | Select-Object -First 1
             if (-not $matchedAlias) {
                 if ($RequireCompleteMatch) {
                     return $null
                 }
+
+                $tokenMatches.Clear()
                 break
             }
 
-            if (-not $detectedTags.Contains($matchedAlias.Canonical)) {
-                $detectedTags.Add($matchedAlias.Canonical) | Out-Null
+            if (-not $tokenMatches.Contains($matchedAlias.Canonical)) {
+                $tokenMatches.Add($matchedAlias.Canonical) | Out-Null
             }
             $rest = $rest.Substring($matchedAlias.Alias.Length)
+        }
+
+        if ($rest.Length -eq 0) {
+            foreach ($tag in $tokenMatches) {
+                if (-not $detectedTags.Contains($tag)) {
+                    $detectedTags.Add($tag) | Out-Null
+                }
+            }
         }
     }
 
