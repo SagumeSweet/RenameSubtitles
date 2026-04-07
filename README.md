@@ -1,262 +1,89 @@
-# Rename Subtitle Scripts
+# Rename-Subtitles / 字幕批量对齐脚本
 
-一个用于 **对齐字幕** 的 PowerShell 脚本。
+一个用于**批量把字幕文件名对齐到对应视频**的 PowerShell 脚本。
 
-## 功能概览
+适合这类场景：
 
-### 1. 按集数匹配视频与字幕
+- 视频和字幕命名风格不一致
+- 文件名里混有 `1080p`、`HEVC`、`10bit`、`WEB-DL`、`SCJP` 等发布信息
+- 简中 / 繁中 / 日语 / 英语字幕混在一起
+- 字幕放在 `sc`、`tc`、`jp` 等子目录里
 
-脚本默认认为：
+> 脚本**只处理字幕文件**，不会修改视频文件。
 
-> **同一个目录中的视频属于同一季，因此只按“集数”匹配，不处理季度问题。**
+---
 
-支持识别的集数形式包括：
+## 核心规则
+
+1. **同目录默认视为同一季**，主要按“集数”匹配。
+2. `-VideoQuery` / `-SubtitleQuery` 只做**粗筛**，最终仍靠集数和文件名相似度判断。
+3. 语种优先级固定为：
+
+   > **文件名 > 所在语言目录 > `-LanguageHint`**
+
+4. 遇到不确定情况（如找不到集数、候选视频太多、目标文件已存在）会**跳过**，不会乱改。
+5. 第一次使用建议始终先加 `-WhatIf` 预览。
+
+---
+
+## 内置识别能力
+
+### 集数格式
+
+默认支持：
 
 - `S01E01`
 - `E01`
 - `[01]`
-- `第01集`
-- `第1話`
-- `1` / `2`
+- `第01集` / `第1話`
+- `01` / `1`
 - 全角数字：`１` / `２`
 
-识别后会统一转换成内部键值，例如：
+### 常见语种写法
 
-- `E01`
-- `E02`
-
----
-
-### 2. 用 PowerShell 通配符先做粗筛
-
-脚本会先根据你传入的关键词，结合扩展名白名单生成通配符数组，然后再用正则做精确匹配。
-
-例如：
-
-- `-VideoQuery "1080p"`
-- `-SubtitleQuery "big5"`
-
-这类参数的作用是：
-
-- **缩小候选文件范围**
-- 不是最终判断依据
-
----
-
-### 3. 自动识别语种标签
-
-脚本内置语种别名表，支持从字幕文件名中识别：
-
-| 输出标签 | 可识别别名示例 |
+| 最终输出 | 常见别名示例 |
 |---|---|
-| `JP` | `jp`, `jpn`, `ja`, `japanese`, `日语`, `日文` |
-| `SC` | `sc`, `chs`, `gb`, `cn`, `简中`, `简体`, `简体中文` |
-| `TC` | `tc`, `cht`, `big5`, `繁中`, `繁體`, `繁體中文` |
+| `JP` | `jp`、`jpn`、`ja`、`japanese`、`日本語`、`日语`、`日文` |
+| `EN` | `en`、`eng`、`english`、`英文`、`英语` |
+| `SC` | `sc`、`chs`、`zhs`、`zh-cn`、`zh-hans`、`gb`、`简中`、`简体中文` |
+| `TC` | `tc`、`cht`、`zht`、`zh-tw`、`zh-hant`、`big5`、`繁中`、`繁體中文` |
 
-支持的命名风格包括：
+支持 `SCJP`、`BIG5JP`、`name.jp.ass`、`name_zh-cn.ass` 这类常见风格。
 
-- `name.jp.ass`
-- `name-jp.ass`
-- `name_jp.ass`
-- `[big5]`
-- `SCJP`
-- `CHSJP`
-- `BIG5JP`
+### 语种输出规则
 
-### 输出规则
+- 全大写
+- 不加分隔符
+- 中文放最后
 
-- 无分隔符
-- 统一大写
-- 中文标签放最后
+例如：`SCJP -> JPSC`、`JP + TC -> JPTC`
 
-例如：
+### 自动忽略的常见噪声
 
-- `SCJP` -> `JPSC`
-- `JP + TC` -> `JPTC`
+会自动清理这类发布信息，避免干扰集数判断：
 
----
-
-### 4. 自动清洗视频发布信息噪声
-
-为了避免把 `1080p`、`x265`、`10bit` 等内容误识别成集数，脚本会自动清洗常见发布参数，例如：
-
-- `1080p`, `720p`, `2160p`
-- `x264`, `x265`, `h264`, `h265`, `hevc`, `avc`
-- `10bit`, `8bit`
-- `WEB-DL`, `WEBRip`, `BDRip`, `Bluray`, `Remux`
-- `AAC`, `FLAC`, `DTS`, `TrueHD`, `Atmos`
+- 分辨率：`480p` `720p` `1080p` `2160p` `4K`
+- 片源：`WEB-DL` `WEBRip` `BluRay` `BDRip` `Remux`
+- 编码：`x264` `x265` `H264` `H265` `HEVC` `AV1`
+- 其他：`10bit` `HDR` `DV` `DoVi` `AAC` `DTS` `Atmos` `SDH` `CC`
 
 ---
 
-### 5. 支持语言子文件夹自动处理
+## 快速开始
 
-如果目录中存在类似下面的结构：
-
-```text
-Anime 01.mkv
-Anime 02.mkv
-sc\[SubGroup] Anime [01].ass
-tc\[SubGroup] Anime [02].ass
-```
-
-脚本运行时会检测到：
-
-- `sc`
-- `tc`
-- `jp`
-
-这类语言子目录，并在运行中提示：
-
-> 是否自动搜索这些子目录中的字幕，并移动到视频所在目录旁边。
-
-如果你加上 `-Recurse`，则会直接递归处理，不再提示。
-
----
-
-### 6. 不会修改视频文件
-
-脚本**不会重命名、不会移动、不会修改任何视频文件**。
-
-视频文件仅用于：
-
-- 识别集数
-- 提供目标文件名模板
-
-真正被改动的只有字幕文件。
-
----
-
-## 文件说明
-
-当前项目包含：
-
-- `Rename-Subtitles.ps1`：主脚本
-- `Install-RenameSubtitles-Command.ps1`：用于把主脚本封装成 PowerShell 命令
-
----
-
-## 安装为命令
-
-如果你想把脚本封装成命令，在 PowerShell 中执行：
+### 1. 先预览
 
 ```powershell
-& "I:\ProgramFiles\PowershellScript\RenameSubtitle\Install-RenameSubtitles-Command.ps1"
+.\Rename-Subtitles.ps1 -Directory "D:\Anime" -WhatIf
 ```
 
-执行后，你就可以直接使用：
-
-```powershell
-rename-subtitles -Directory . -WhatIf
-```
-
-或者使用简写：
-
-```powershell
-rs -Directory . -WhatIf
-```
-
----
-
-## 详细用法
-
-### 基本格式
-
-```powershell
-.\Rename-Subtitles.ps1 \
-  [-Directory <路径>] \
-  [-VideoQuery <视频粗筛关键词>] \
-  [-SubtitleQuery <字幕粗筛关键词>] \
-  [-LanguageHint <语种提示>] \
-  [-VideoEpisodePatterns <正则数组>] \
-  [-SubtitleEpisodePatterns <正则数组>] \
-  [-Recurse] \
-  [-WhatIf]
-```
-
----
-
-## 参数说明
-
-### `-Directory`
-
-要处理的目录，默认是当前目录。
-
-示例：
+### 2. 确认无误后正式执行
 
 ```powershell
 .\Rename-Subtitles.ps1 -Directory "D:\Anime"
 ```
 
----
-
-### `-VideoQuery`
-
-用于粗筛视频文件的关键词。
-
-例如只处理名称里带 `1080p` 的视频：
-
-```powershell
-.\Rename-Subtitles.ps1 -Directory "D:\Anime" -VideoQuery "1080p"
-```
-
----
-
-### `-SubtitleQuery`
-
-用于粗筛字幕文件的关键词。
-
-例如只处理带 `big5` 的字幕：
-
-```powershell
-.\Rename-Subtitles.ps1 -Directory "D:\Anime" -SubtitleQuery "big5"
-```
-
-> 注意：它现在只用于筛字幕文件，不再兼任语种提示。
-
----
-
-### `-LanguageHint`
-
-当字幕文件名和目录都无法识别语种时，手动指定一个语种提示。
-
-例如：
-
-```powershell
-.\Rename-Subtitles.ps1 -Directory "D:\Anime" -LanguageHint "big5"
-```
-
-那么未识别语种的字幕，会优先尝试按 `TC` 处理。
-
----
-
-### `-VideoEpisodePatterns`
-
-自定义视频文件名的集数提取正则数组。
-
-一般不需要改，除非你的视频命名特别特殊。
-
----
-
-### `-SubtitleEpisodePatterns`
-
-自定义字幕文件名的集数提取正则数组。
-
-例如：
-
-```powershell
-.\Rename-Subtitles.ps1 -SubtitleEpisodePatterns @(
-  '(?i)\[(?<episode>\d{1,2})\]',
-  '(?i)第\s*(?<episode>\d{1,2})\s*[集话話]'
-)
-```
-
----
-
-### `-Recurse`
-
-递归扫描子目录。
-
-当字幕被解压在 `sc` / `tc` / `jp` 等子目录里时，推荐使用。
+### 3. 字幕在子目录里时递归处理
 
 ```powershell
 .\Rename-Subtitles.ps1 -Directory "D:\Anime" -Recurse -WhatIf
@@ -264,11 +91,23 @@ rs -Directory . -WhatIf
 
 ---
 
-### `-WhatIf`
+## 使用方法
 
-预览模式，不会真正修改文件。
+### 基本格式
 
-这是第一次使用时**强烈推荐**的参数：
+```powershell
+.\Rename-Subtitles.ps1 `
+  [-Directory <路径>] `
+  [-VideoQuery <视频粗筛关键词>] `
+  [-SubtitleQuery <字幕粗筛关键词>] `
+  [-LanguageHint <语种提示>] `
+  [-VideoEpisodePatterns <正则数组>] `
+  [-SubtitleEpisodePatterns <正则数组>] `
+  [-Recurse] `
+  [-WhatIf]
+```
+
+一行写法也可以：
 
 ```powershell
 .\Rename-Subtitles.ps1 -Directory "D:\Anime" -WhatIf
@@ -276,105 +115,151 @@ rs -Directory . -WhatIf
 
 ---
 
-## 常见示例
+## 可选：封装成 `pwsh` 里的命令
 
-### 示例 1：预览当前目录中的重命名结果
+如果你经常使用，建议把它写进 PowerShell Profile。这样打开 `pwsh` 后可以直接用 `rename-subtitles` 或 `rs`。
+
+### 查看并创建 `$PROFILE`
 
 ```powershell
-.\Rename-Subtitles.ps1 -WhatIf
+$PROFILE
+
+if (-not (Test-Path $PROFILE)) {
+    New-Item -ItemType File -Path $PROFILE -Force | Out-Null
+}
 ```
+
+### 推荐封装方式（保留参数补全）
+
+```powershell
+function rename-subtitles {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [string]$Directory = ".",
+        [string]$VideoQuery = "",
+        [string]$SubtitleQuery = "",
+        [string]$LanguageHint = "",
+        [string[]]$VideoEpisodePatterns = @(),
+        [string[]]$SubtitleEpisodePatterns = @(),
+        [switch]$Recurse
+    )
+
+    $params = @{
+        Directory               = $Directory
+        VideoQuery              = $VideoQuery
+        SubtitleQuery           = $SubtitleQuery
+        LanguageHint            = $LanguageHint
+        VideoEpisodePatterns    = $VideoEpisodePatterns
+        SubtitleEpisodePatterns = $SubtitleEpisodePatterns
+        Recurse                 = $Recurse
+    }
+
+    if ($WhatIfPreference) {
+        $params.WhatIf = $true
+    }
+
+    & "E:\Study\Powershell\RenameSubtitle\Rename-Subtitles.ps1" @params
+}
+
+Set-Alias rs rename-subtitles
+```
+
+保存后执行：
+
+```powershell
+. $PROFILE
+```
+
+以后就可以直接这样用：
+
+```powershell
+rename-subtitles -Directory "D:\Anime" -WhatIf
+rs -Directory "D:\Anime" -WhatIf
+```
+
+> 不建议用 `ArgsList` 全量透传的简写函数；那种写法通常拿不到底层参数的自动补全。
 
 ---
 
-### 示例 2：处理指定目录
+## 参数说明
 
-```powershell
-.\Rename-Subtitles.ps1 -Directory "D:\Anime"
-```
+| 参数 | 作用 |
+|---|---|
+| `-Directory` | 指定处理目录，默认是当前目录 |
+| `-VideoQuery` | 粗筛视频文件，缩小候选范围 |
+| `-SubtitleQuery` | 粗筛字幕文件，只筛文件，不负责语种判断 |
+| `-LanguageHint` | 当文件名和目录都识别不出语种时，提供兜底语种 |
+| `-VideoEpisodePatterns` | 自定义视频文件名的集数正则 |
+| `-SubtitleEpisodePatterns` | 自定义字幕文件名的集数正则 |
+| `-Recurse` | 递归扫描子目录 |
+| `-WhatIf` | 预览模式，不真正修改文件 |
 
----
-
-### 示例 3：只处理 `big5` 字幕
+### 常见参数示例
 
 ```powershell
 .\Rename-Subtitles.ps1 -Directory "D:\Anime" -SubtitleQuery "big5" -WhatIf
+.\Rename-Subtitles.ps1 -Directory "D:\Anime" -LanguageHint "zh-cn" -WhatIf
+.\Rename-Subtitles.ps1 -Directory "D:\Mixed" -VideoQuery "Hotel" -SubtitleQuery "Hotel" -WhatIf
 ```
 
 ---
 
-### 示例 4：递归处理语言子文件夹
+## 手动传入正则的示例
+
+只有默认规则识别不好时，才建议手动传正则。
+
+### 案例 1：视频是 `Episode-01`，字幕是 `第01话`
 
 ```powershell
-.\Rename-Subtitles.ps1 -Directory "D:\Anime" -Recurse -WhatIf
+.\Rename-Subtitles.ps1 -Directory "D:\Anime" `
+  -VideoEpisodePatterns @(
+    '(?i)Episode[-_ ](?<episode>\d{1,2})'
+  ) `
+  -SubtitleEpisodePatterns @(
+    '(?i)第\s*(?<episode>\d{1,2})\s*[话話]'
+  ) `
+  -WhatIf
 ```
 
----
-
-### 示例 5：手动指定语种提示
+### 案例 2：视频是 `EP01`，字幕是 `01v2`
 
 ```powershell
-.\Rename-Subtitles.ps1 -Directory "D:\Anime" -LanguageHint "jp" -WhatIf
+.\Rename-Subtitles.ps1 -Directory "D:\Anime" `
+  -VideoEpisodePatterns @(
+    '(?i)\bEP(?<episode>\d{1,2})\b'
+  ) `
+  -SubtitleEpisodePatterns @(
+    '(?i)(?<episode>\d{1,2})v\d+'
+  ) `
+  -WhatIf
 ```
+
+### 使用建议
+
+1. 尽量使用命名捕获组：`(?<episode>\d{1,2})`
+2. 多套规则时，把**最准确的放前面**
+3. 一定先配合 `-WhatIf` 预览
 
 ---
 
 ## 输出状态说明
 
-脚本执行后会输出结果对象，并附带汇总统计。
-
-常见状态如下：
-
 | 状态 | 含义 |
 |---|---|
-| `Renamed` | 已在原目录中完成重命名 |
-| `MovedRenamed` | 已从子目录移动到视频目录并完成重命名 |
-| `Unchanged` | 新旧文件名相同，无需处理 |
+| `Renamed` | 已在原目录完成重命名 |
+| `MovedRenamed` | 已从子目录移动到视频目录并重命名 |
+| `Unchanged` | 文件名本来就已经是目标格式，无需处理 |
 | `SkippedExists` | 目标文件已存在，已跳过 |
-| `Ambiguous` | 有多个候选视频，无法自动判断 |
-| `Error` | 处理单个字幕时出现异常 |
-| `WhatIf` | 预览模式，未真正改动文件 |
-
----
-
-## 结果汇总示例
-
-```text
-处理结果汇总：
-  Renamed       : 5
-  MovedRenamed  : 2
-  SkippedExists : 1
-  Ambiguous     : 1
-  Error         : 0
-```
+| `Ambiguous` | 同一集有多个候选视频，脚本无法安全判断 |
+| `Error` | 处理该字幕时发生异常 |
+| `WhatIf` | 预览模式，仅展示结果，未真正修改 |
 
 ---
 
 ## 注意事项
 
-1. **第一次使用建议加 `-WhatIf`**
-2. 默认按“同目录同一季”处理，不考虑季度匹配
-3. 视频文件不会被修改
-4. 如果某些字幕完全没有集数信息，脚本无法自动匹配
-5. 如果同一集存在多个视频候选，脚本会尽量用相似度判断；无法区分时会跳过并提示
-
----
-
-## 建议的使用顺序
-
-### 第一步：预览
-
-```powershell
-rename-subtitles -Directory "你的目录" -WhatIf
-```
-
-### 第二步：确认输出没问题后正式执行
-
-```powershell
-rename-subtitles -Directory "你的目录"
-```
-
-### 第三步：遇到子目录字幕时使用递归
-
-```powershell
-rename-subtitles -Directory "你的目录" -Recurse -WhatIf
-```
+1. 第一次使用建议先加 `-WhatIf`
+2. 默认按“同目录同一季”处理，不单独判断季度
+3. 视频文件不会被改动
+4. `-LanguageHint` 是兜底提示，不是强制覆盖
+5. 如果完全识别不出集数，脚本就无法自动配对
