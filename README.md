@@ -15,14 +15,16 @@
 
 ## 核心规则
 
-1. **同目录默认视为同一季**，主要按“集数”匹配。
-2. `-VideoQuery` / `-SubtitleQuery` 只做**粗筛**，最终仍靠集数和文件名相似度判断。
+1. 视频和字幕先按扩展名及 `-VideoQuery` / `-SubtitleQuery` 筛选，再分别提取集数并按整数匹配。
+2. `-VideoQuery` / `-SubtitleQuery` 是文件名包含关键词的筛选条件；文件名相似度只在同一集有多个候选视频时用于消歧。
 3. 语种优先级固定为：
 
    > **文件名 > 所在语言目录 > `-LanguageHint`**
 
-4. 遇到不确定情况（如找不到集数、候选视频太多、目标文件已存在）会**跳过**，不会乱改。
-5. 第一次使用建议始终先加 `-WhatIf` 预览。
+4. 同一集的多语种字幕在自动偏移计数时只算一个集数。
+5. 遇到无法识别集数、没有匹配视频、候选视频无法消歧或目标文件已存在时，不会强行重命名。
+6. `-Recurse` 会将扫描到的文件作为一个处理批次；脚本不解析季号。跨季度且集数重置时，请按季度分别运行。
+7. 第一次使用建议先加 `-WhatIf` 预览。
 
 ---
 
@@ -37,7 +39,10 @@
 - `[01]`
 - `第01集` / `第1話`
 - `01` / `1`
+- `001` / `0001` 等带任意位数前导零的集数（先去掉前导零，再按正整数匹配；数值需在 `Int32` 范围内）
 - 全角数字：`１` / `２`
+
+无分隔符的裸数字需要位于文件名开头，或由空格、点、下划线、连字符、方括号、圆括号等分隔；例如 `abc 001.ass` 可识别。自定义正则中的集数捕获也应使用命名组 `(?<episode>...)`，集数文本需能转换为 `Int32`。
 
 ### 常见语种写法
 
@@ -103,6 +108,7 @@
   [-LanguageHint <语种提示>] `
   [-VideoEpisodePatterns <正则数组>] `
   [-SubtitleEpisodePatterns <正则数组>] `
+  [-EpisodeAdd <手动字幕集数偏移 int>] `
   [-Recurse] `
   [-WhatIf]
 ```
@@ -141,6 +147,7 @@ function rename-subtitles {
         [string]$LanguageHint = "",
         [string[]]$VideoEpisodePatterns = @(),
         [string[]]$SubtitleEpisodePatterns = @(),
+        [int]$EpisodeAdd = 0,
         [switch]$Recurse
     )
 
@@ -151,6 +158,7 @@ function rename-subtitles {
         LanguageHint            = $LanguageHint
         VideoEpisodePatterns    = $VideoEpisodePatterns
         SubtitleEpisodePatterns = $SubtitleEpisodePatterns
+        EpisodeAdd              = $EpisodeAdd
         Recurse                 = $Recurse
     }
 
@@ -158,11 +166,13 @@ function rename-subtitles {
         $params.WhatIf = $true
     }
 
-    & "E:\Study\Powershell\RenameSubtitle\Rename-Subtitles.ps1" @params
+    & "D:\Tools\Rename-Subtitles.ps1" @params
 }
 
 Set-Alias rs rename-subtitles
 ```
+
+将示例中的 `D:\Tools\Rename-Subtitles.ps1` 替换为脚本在本机的实际路径。
 
 保存后执行：
 
@@ -191,6 +201,7 @@ rs -Directory "D:\Anime" -WhatIf
 | `-LanguageHint` | 当文件名和目录都识别不出语种时，提供兜底语种 |
 | `-VideoEpisodePatterns` | 自定义视频文件名的集数正则 |
 | `-SubtitleEpisodePatterns` | 自定义字幕文件名的集数正则 |
+| `-EpisodeAdd` | 字幕集数偏移。默认 `0` 时尝试自动推导；非零值覆盖自动推导。正数增加、负数减少 |
 | `-Recurse` | 递归扫描子目录 |
 | `-WhatIf` | 预览模式，不真正修改文件 |
 
@@ -201,6 +212,20 @@ rs -Directory "D:\Anime" -WhatIf
 .\Rename-Subtitles.ps1 -Directory "D:\Anime" -LanguageHint "zh-cn" -WhatIf
 .\Rename-Subtitles.ps1 -Directory "D:\Mixed" -VideoQuery "Hotel" -SubtitleQuery "Hotel" -WhatIf
 ```
+
+### 自动推导集数偏移
+
+默认情况下（`-EpisodeAdd 0`），脚本会比较筛选到的视频和字幕中的**不同集数**。两边集数数量相同、所有候选文件都能识别集数，且分别排序后逐项计算出的差值一致时，自动使用该差值匹配。相同集数的多语种字幕只计一次。
+
+偏移的计算方向是“视频集数 - 字幕集数”。例如视频集数为 `1..12`、字幕集数为 `13..24`，脚本会推导偏移 `-12`，再将偏移加到每个字幕集数上进行视频匹配。若数量不一致、存在无法识别的候选文件或逐项差值不一致，则不自动偏移，按零偏移继续尝试匹配；如需强制偏移，可手动指定：
+
+```powershell
+.\Rename-Subtitles.ps1 -Directory "D:\Anime\Season02" -EpisodeAdd -12 -WhatIf
+```
+
+非零 `-EpisodeAdd` 会直接覆盖自动推导。自动推导只针对本次筛选到的文件批次；若递归扫描多个季度且每季集数都从 1 重新开始，脚本不会按目录名识别季别，还可能出现重复集数的多个候选视频。建议按季度分别运行。
+
+结果中的集数键会按本次识别到的最长集数字符串补零。实际字幕文件名以匹配视频的主体名为准，识别到语种时再追加语种标签；处理语言子目录中的字幕时，字幕可能会移动到视频所在目录。
 
 ---
 
@@ -213,10 +238,10 @@ rs -Directory "D:\Anime" -WhatIf
 ```powershell
 .\Rename-Subtitles.ps1 -Directory "D:\Anime" `
   -VideoEpisodePatterns @(
-    '(?i)Episode[-_ ](?<episode>\d{1,2})'
+    '(?i)Episode[-_ ](?<episode>\d+)'
   ) `
   -SubtitleEpisodePatterns @(
-    '(?i)第\s*(?<episode>\d{1,2})\s*[话話]'
+    '(?i)第\s*(?<episode>\d+)\s*[话話]'
   ) `
   -WhatIf
 ```
@@ -226,17 +251,17 @@ rs -Directory "D:\Anime" -WhatIf
 ```powershell
 .\Rename-Subtitles.ps1 -Directory "D:\Anime" `
   -VideoEpisodePatterns @(
-    '(?i)\bEP(?<episode>\d{1,2})\b'
+    '(?i)\bEP(?<episode>\d+)\b'
   ) `
   -SubtitleEpisodePatterns @(
-    '(?i)(?<episode>\d{1,2})v\d+'
+    '(?i)(?<episode>\d+)v\d+'
   ) `
   -WhatIf
 ```
 
 ### 使用建议
 
-1. 尽量使用命名捕获组：`(?<episode>\d{1,2})`
+1. 尽量使用命名捕获组：`(?<episode>\d+)`
 2. 多套规则时，把**最准确的放前面**
 3. 一定先配合 `-WhatIf` 预览
 

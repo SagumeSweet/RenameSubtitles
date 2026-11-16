@@ -4,13 +4,16 @@
 
 .DESCRIPTION
     该脚本会在指定目录中查找视频与字幕，按“集数”进行匹配，
-    再将字幕重命名为与对应视频相同的主体名称，并在需要时追加语种标签。
+    将字幕重命名为与对应视频相同的主体名称，并在需要时追加语种标签。
+    默认先按不同集数集合推导统一偏移；也可用 EpisodeAdd 显式指定偏移。
 
     设计目标：
     1. 只处理字幕，不修改任何视频文件。
-    2. 同一个目录默认视为同一季，只按集数匹配。
-    3. 先用 PowerShell 通配符粗筛，再用正则精确提取集数与语种。
-    4. 如果检测到 `sc` / `tc` / `jp` 等语言子文件夹，会在运行时询问是否自动处理。
+    2. 集数按整数匹配，保留数字文本宽度用于结果显示；前导零不影响匹配。
+    3. 先按查询词和扩展名筛选文件，再用正则提取集数和语种。
+    4. 只在同集有多个候选视频时，才用文件名相似度尝试消歧。
+    5. 检测到语言子文件夹时，可选择自动扫描字幕并移动到视频目录。
+    6. 递归扫描视为一个处理批次，不解析季号；不同季度集数重置时应分开运行。
 
 .PARAMETER Directory
     要处理的目录，默认是当前目录。
@@ -31,7 +34,13 @@
     用于从字幕文件名提取集数的正则表达式数组。
 
 .PARAMETER Recurse
-    是否递归扫描子目录。
+    是否递归扫描子目录。递归范围内的文件会作为同一批次处理，不按季号分组。
+
+.PARAMETER EpisodeAdd
+    字幕集数偏移。默认 0 表示尝试自动推导；非零值表示手动偏移并覆盖自动推导。
+
+.PARAMETER WhatIf
+    预览将执行的字幕重命名或移动，不实际修改文件。
 
 .EXAMPLE
     .\Rename-Subtitles.ps1 -Directory 'D:\Anime' -WhatIf
@@ -47,7 +56,8 @@ param (
     [string]$LanguageHint = "",
     [string[]]$VideoEpisodePatterns = @(),
     [string[]]$SubtitleEpisodePatterns = @(),
-    [switch]$Recurse
+    [switch]$Recurse,
+    [int]$EpisodeAdd = 0
 )
 
 Set-StrictMode -Version Latest
@@ -115,11 +125,11 @@ $script:ReleaseNoiseRules = [ordered]@{
 
 # 默认集数识别正则：当外部传入 $null 或空数组时，自动回退到这一组。
 [string[]]$script:DefaultEpisodePatterns = @(
-    '(?i)\bS(?<season>\d{1,2})[ ._-]*E(?<episode>\d{1,3})\b',
-    '(?i)\bE(?<episode>\d{1,3})\b',
-    '(?i)\[(?<episode>\d{1,3})\]',
-    '(?i)第\s*(?<episode>\d{1,3})\s*[集话話]',
-    '(?i)(?:^|[\s._\-\[\(])(?<episode>\d{1,2})(?:$|[\s._\-\]\)])'
+    '(?i)\bS(?<season>\d+)[ ._-]*E(?<episode>\d+)\b',
+    '(?i)\bE(?<episode>\d+)\b',
+    '(?i)\[(?<episode>\d+)\]',
+    '(?i)第\s*(?<episode>\d+)\s*[集话話]',
+    '(?i)(?:^|[\s._\-\[\(])(?<episode>\d+)(?:$|[\s._\-\]\)])'
 )
 
 # 统一控制语种标签输出顺序，并缓存语种别名元数据/噪声正则，避免每次识别都重复构造。
@@ -148,7 +158,7 @@ function Write-Log {
 
 function New-SearchPatterns {
     <#
-        根据用户输入的关键词和扩展名，拼出 `Get-ChildItem -Include` 可用的通配符数组。
+        根据用户输入的关键词和扩展名，生成供文件名通配符匹配使用的模式数组。
     #>
     param(
         [string]$Query,
@@ -242,7 +252,7 @@ function Remove-ReleaseNoise {
 
 function Get-EpisodeKey {
     <#
-        从文件名中提取集数，并统一格式为 E01 / E02。
+        从文件名中提取集数，返回整数和原始数字宽度。
         当前脚本按“同目录同一季”设计，因此只保留集数，不保留季号。
     #>
     param(
@@ -259,24 +269,135 @@ function Get-EpisodeKey {
             continue
         }
 
+        $episodeText = $null
         $episodeGroup = $match.Groups['episode']
         if ($episodeGroup.Success) {
-            return ('E{0:D2}' -f [int]$episodeGroup.Value)
+            $episodeText = $episodeGroup.Value
         }
-
-        $captureValues = @()
-        for ($index = 1; $index -lt $match.Groups.Count; $index++) {
-            if ($match.Groups[$index].Success -and $match.Groups[$index].Value -match '^\d+$') {
-                $captureValues += $match.Groups[$index].Value
+        else {
+            for ($index = 1; $index -lt $match.Groups.Count; $index++) {
+                if ($match.Groups[$index].Success -and $match.Groups[$index].Value -match '^\d+$') {
+                    $episodeText = $match.Groups[$index].Value
+                    break
+                }
             }
         }
 
-        if (@($captureValues).Count -ge 1) {
-            return ('E{0:D2}' -f [int]$captureValues[0])
+        if ($null -ne $episodeText) {
+            $normalizedEpisodeText = [regex]::Replace($episodeText, '^0+', '')
+            if ([string]::IsNullOrEmpty($normalizedEpisodeText)) {
+                $normalizedEpisodeText = '0'
+            }
+
+            [int]$episodeNumber = 0
+            if ([int]::TryParse($normalizedEpisodeText, [ref]$episodeNumber)) {
+                return [PSCustomObject]@{
+                    Number = $episodeNumber
+                    Width  = $episodeText.Length
+                }
+            }
         }
     }
 
     return $null
+}
+
+function Get-EpisodeNumber {
+    param(
+        [string]$Name,
+        [string[]]$Patterns
+    )
+
+    $episodeInfo = Get-EpisodeKey -Name $Name -Patterns $Patterns
+    if ($null -ne $episodeInfo) {
+        return [int]$episodeInfo.Number
+    }
+
+    return $null
+}
+
+function Get-EpisodeInventory {
+    param(
+        [System.IO.FileInfo[]]$Files,
+        [string[]]$EpisodePatterns,
+        [string]$Label
+    )
+
+    $episodeNumbers = [System.Collections.Generic.SortedSet[int]]::new()
+    $unmatchedFiles = New-Object System.Collections.Generic.List[string]
+    $displayWidth = 1
+
+    foreach ($file in $Files) {
+        $episodeInfo = Get-EpisodeKey -Name $file.BaseName -Patterns $EpisodePatterns
+        if ($null -eq $episodeInfo) {
+            $unmatchedFiles.Add($file.Name) | Out-Null
+            continue
+        }
+
+        $episodeNumbers.Add([int]$episodeInfo.Number) | Out-Null
+        $displayWidth = [Math]::Max($displayWidth, [int]$episodeInfo.Width)
+    }
+
+    return [PSCustomObject]@{
+        Label         = $Label
+        Episodes      = [int[]]@($episodeNumbers)
+        UnmatchedFiles = [string[]]@($unmatchedFiles)
+        DisplayWidth  = $displayWidth
+    }
+}
+
+function Resolve-EpisodeOffset {
+    param(
+        [object]$VideoInventory,
+        [object]$SubtitleInventory,
+        [int]$ManualOffset
+    )
+
+    if ($ManualOffset -ne 0) {
+        Write-Log -Level Info -Message "使用手动字幕集数偏移：$ManualOffset"
+        return $ManualOffset
+    }
+
+    if (@($VideoInventory.UnmatchedFiles).Count -gt 0 -or @($SubtitleInventory.UnmatchedFiles).Count -gt 0) {
+        Write-Log -Level Warn -Message '存在无法识别集数的候选文件，跳过自动偏移推导；如需偏移请显式指定 -EpisodeAdd。'
+        return 0
+    }
+
+    [int[]]$videoEpisodes = @($VideoInventory.Episodes)
+    [int[]]$subtitleEpisodes = @($SubtitleInventory.Episodes)
+    if ($videoEpisodes.Count -ne $subtitleEpisodes.Count) {
+        Write-Log -Level Warn -Message "视频与字幕的不同集数数量不一致（视频 $($videoEpisodes.Count)，字幕 $($subtitleEpisodes.Count)），跳过自动偏移推导。"
+        return 0
+    }
+
+    if ($videoEpisodes.Count -eq 0) {
+        Write-Log -Level Warn -Message '没有可用于推导偏移的集数。'
+        return 0
+    }
+
+    [int[]]$offsets = @(
+        for ($index = 0; $index -lt $videoEpisodes.Count; $index++) {
+            $videoEpisodes[$index] - $subtitleEpisodes[$index]
+        }
+    )
+    $distinctOffsets = @($offsets | Select-Object -Unique)
+    if ($distinctOffsets.Count -ne 1) {
+        Write-Log -Level Warn -Message '按集数排序后，各集的偏移量不一致，跳过自动偏移推导。'
+        return 0
+    }
+
+    $resolvedOffset = [int]$distinctOffsets[0]
+    Write-Log -Level Info -Message "自动推导字幕集数偏移：$resolvedOffset（视频与字幕均有 $($videoEpisodes.Count) 个不同集数）"
+    return $resolvedOffset
+}
+
+function Format-EpisodeNumber {
+    param([int]$EpisodeNumber)
+
+    return $EpisodeNumber.ToString(
+        ('D{0}' -f $script:EpisodeDisplayWidth),
+        [System.Globalization.CultureInfo]::InvariantCulture
+    )
 }
 
 function Get-LanguageMetadata {
@@ -457,7 +578,7 @@ function Get-MatchTokens {
     $normalizedName = Convert-ToHalfWidthDigits -Text $Name
     $cleanName = [regex]::Replace(
         (Remove-ReleaseNoise -Text $normalizedName),
-        '(?i)(?:\bS\d{1,2}[ ._-]*E\d{1,3}\b|\bE\d{1,3}\b|第\s*\d{1,3}\s*[集话話])',
+        '(?i)(?:\bS\d+[ ._-]*E\d+\b|\bE\d+\b|第\s*\d+\s*[集话話])',
         ' '
     )
 
@@ -761,6 +882,7 @@ function Confirm-LanguageFolderProcessing {
 
 function Get-VideoEpisodeIndex {
     <#
+        输入视频列表和正则条件，返回集数（int类型）为键的字典，字典值都是空列表
         将视频预先建立为“集数键 -> 候选视频列表”的索引，便于后续字幕匹配。
     #>
     param(
@@ -768,16 +890,16 @@ function Get-VideoEpisodeIndex {
         [string[]]$EpisodePatterns
     )
 
-    $videosByEpisode = @{}
+    $videosByEpisode = [System.Collections.Generic.Dictionary[int, System.Collections.Generic.List[object]]]::new()
     foreach ($video in @($Videos | Sort-Object Name)) {
-        $episodeKey = Get-EpisodeKey -Name $video.BaseName -Patterns $EpisodePatterns
-        if (-not $episodeKey) {
+        $episodeKey = Get-EpisodeNumber -Name $video.BaseName -Patterns $EpisodePatterns
+        if ($null -eq $episodeKey) {
             Write-Verbose "跳过无法识别集数的视频：$($video.Name)"
             continue
         }
 
         if (-not $videosByEpisode.ContainsKey($episodeKey)) {
-            $videosByEpisode[$episodeKey] = New-Object System.Collections.Generic.List[object]
+            $videosByEpisode.add($episodeKey, (New-Object System.Collections.Generic.List[object]))
         }
 
         $videosByEpisode[$episodeKey].Add($video)
@@ -822,29 +944,38 @@ function Invoke-SubtitleRenameAction {
         处理单个字幕文件：识别集数、匹配视频、解析语种、执行改名/移动。
         将单文件逻辑收敛到一个函数中，主流程只负责“扫描与调度”。
     #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [System.Management.Automation.PSCmdlet]$Cmdlet,
         [System.IO.FileInfo]$Subtitle,
-        [hashtable]$VideosByEpisode,
+        [System.Collections.Generic.Dictionary[int, System.Collections.Generic.List[object]]]$VideosByEpisode,
         [string[]]$EpisodePatterns,
         [object[]]$LanguageFolders,
         [string]$RequestedLanguageTag,
         [bool]$ProcessLanguageFolders,
-        [System.Collections.IDictionary]$Rules
+        [System.Collections.IDictionary]$Rules,
+        [int]$EpisodeAdd
     )
 
     Write-Log -Level Step -Message "处理字幕：$($Subtitle.Name)"
 
-    $episodeKey = Get-EpisodeKey -Name $Subtitle.BaseName -Patterns $EpisodePatterns
-    if (-not $episodeKey) {
+    $subtitleEpisode = Get-EpisodeNumber -Name $Subtitle.BaseName -Patterns $EpisodePatterns
+    if ($null -eq $subtitleEpisode) {
         Write-Log -Level Warn -Message "无法识别集数，已跳过：$($Subtitle.Name)"
         return $null
     }
 
-    Write-Log -Level Info -Message "识别到集数键：$episodeKey"
+    $episodeKey = $subtitleEpisode + $EpisodeAdd
+    if ($episodeKey -lt 0) {
+        Write-Log -Level Warn -Message "偏移后集数小于 0，已跳过：$($Subtitle.Name) [$episodeKey]"
+        return $null
+    }
+
+    $formattedEpisodeKey = Format-EpisodeNumber -EpisodeNumber $episodeKey
+    Write-Log -Level Info -Message "识别到集数键：$formattedEpisodeKey"
 
     if (-not $VideosByEpisode.ContainsKey($episodeKey)) {
-        Write-Log -Level Warn -Message "未找到对应视频：$($Subtitle.Name) [$episodeKey]"
+        Write-Log -Level Warn -Message "未找到对应视频：$($Subtitle.Name) [$formattedEpisodeKey]"
         return $null
     }
 
@@ -852,8 +983,8 @@ function Invoke-SubtitleRenameAction {
     $video = Select-BestVideoMatch -Videos $candidateVideos -SubtitleName $Subtitle.BaseName -Rules $Rules
     if (-not $video) {
         $candidateNames = ($candidateVideos | Select-Object -ExpandProperty Name) -join ', '
-        Write-Log -Level Warn -Message "存在多个候选视频，无法自动判断：$($Subtitle.Name) [$episodeKey]。候选：$candidateNames"
-        return (New-ResultObject -Status 'Ambiguous' -EpisodeKey $episodeKey -Language $null -OldName $Subtitle.Name -NewName $null)
+        Write-Log -Level Warn -Message "存在多个候选视频，无法自动判断：$($Subtitle.Name) [$formattedEpisodeKey]。候选：$candidateNames"
+        return (New-ResultObject -Status 'Ambiguous' -EpisodeKey $formattedEpisodeKey -Language $null -OldName $Subtitle.Name -NewName $null)
     }
 
     Write-Log -Level Info -Message "匹配视频：$($video.Name)"
@@ -873,12 +1004,12 @@ function Invoke-SubtitleRenameAction {
 
     if ($Subtitle.FullName -eq $targetInfo.TargetPath) {
         Write-Log -Level Info -Message '文件名已符合目标格式，无需修改。'
-        return (New-ResultObject -Status 'Unchanged' -EpisodeKey $episodeKey -Language $languageTag -OldName $Subtitle.Name -NewName $targetInfo.NewName)
+        return (New-ResultObject -Status 'Unchanged' -EpisodeKey $formattedEpisodeKey -Language $languageTag -OldName $Subtitle.Name -NewName $targetInfo.NewName)
     }
 
     if (Test-Path -LiteralPath $targetInfo.TargetPath) {
         Write-Log -Level Warn -Message "目标文件已存在，已跳过：$($targetInfo.NewName)"
-        return (New-ResultObject -Status 'SkippedExists' -EpisodeKey $episodeKey -Language $languageTag -OldName $Subtitle.Name -NewName $targetInfo.NewName)
+        return (New-ResultObject -Status 'SkippedExists' -EpisodeKey $formattedEpisodeKey -Language $languageTag -OldName $Subtitle.Name -NewName $targetInfo.NewName)
     }
 
     try {
@@ -894,10 +1025,10 @@ function Invoke-SubtitleRenameAction {
     }
     catch {
         Write-Log -Level Warn -Message "处理字幕失败：$($Subtitle.Name) -> $($targetInfo.NewName)，原因：$($_.Exception.Message)"
-        return (New-ResultObject -Status 'Error' -EpisodeKey $episodeKey -Language $languageTag -OldName $Subtitle.Name -NewName $targetInfo.NewName)
+        return (New-ResultObject -Status 'Error' -EpisodeKey $formattedEpisodeKey -Language $languageTag -OldName $Subtitle.Name -NewName $targetInfo.NewName)
     }
 
-    return (New-ResultObject -Status $status -EpisodeKey $episodeKey -Language $languageTag -OldName $Subtitle.Name -NewName $targetInfo.NewName)
+    return (New-ResultObject -Status $status -EpisodeKey $formattedEpisodeKey -Language $languageTag -OldName $Subtitle.Name -NewName $targetInfo.NewName)
 }
 
 function New-ResultObject {
@@ -1021,7 +1152,13 @@ if (-not $subtitleFiles) {
 
 Write-Log -Level Info -Message "扫描完成：视频 $(@($videoFiles).Count) 个，字幕 $(@($subtitleFiles).Count) 个。"
 
-# 先将视频按集数分组，供后续字幕逐个匹配。
+# 用不同集数集合比较视频和字幕，并推导统一偏移；重复语种字幕不重复计数。
+$videoInventory = Get-EpisodeInventory -Files $videoFiles -EpisodePatterns $VideoEpisodePatterns -Label '视频'
+$subtitleInventory = Get-EpisodeInventory -Files $subtitleFiles -EpisodePatterns $SubtitleEpisodePatterns -Label '字幕'
+$script:EpisodeDisplayWidth = [Math]::Max($videoInventory.DisplayWidth, $subtitleInventory.DisplayWidth)
+$resolvedEpisodeAdd = Resolve-EpisodeOffset -VideoInventory $videoInventory -SubtitleInventory $subtitleInventory -ManualOffset $EpisodeAdd
+
+# 先将视频按整数集数分组，供后续字幕逐个匹配。
 $videosByEpisode = Get-VideoEpisodeIndex -Videos $videoFiles -EpisodePatterns $VideoEpisodePatterns
 
 if (@($videosByEpisode.Keys).Count -eq 0) {
@@ -1042,6 +1179,7 @@ foreach ($subtitle in $subtitleFiles | Sort-Object Name) {
         -LanguageFolders $languageFolders `
         -RequestedLanguageTag $requestedLanguageTag `
         -ProcessLanguageFolders $processLanguageFolders `
+        -EpisodeAdd $resolvedEpisodeAdd `
         -Rules $script:LanguageRules
 
     if ($result) {
